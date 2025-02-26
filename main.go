@@ -2,21 +2,71 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/kardianos/service"
 	"github.com/pelletier/go-toml"
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/auth"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 	"golang.org/x/oauth2"
 )
+
+const (
+	TOKEN_FILE   = "auth_token.toml"
+	VERSION_FILE = "version.txt"
+	LOG_FILE     = "apex_proxy.log"
+	CONFIG_FILE  = "config.toml"
+
+	// Define your GitHub repository details for auto-updating
+	// Replace with your actual repository information
+	GITHUB_REPO_OWNER = "huntieezz"
+	GITHUB_REPO_NAME  = "-APEX-PROXY-"
+	CURRENT_VERSION   = "1.0.0" // Update this when you release a new version
+)
+
+// Program represents the service
+type Program struct {
+	exit chan struct{}
+}
+
+func (p *Program) Start(s service.Service) error {
+	p.exit = make(chan struct{})
+	go p.run()
+	return nil
+}
+
+func (p *Program) Stop(s service.Service) error {
+	close(p.exit)
+	return nil
+}
+
+func (p *Program) run() {
+	// Set up logging to file
+	logFile, err := os.OpenFile(LOG_FILE, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer logFile.Close()
+	log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+
+	// Check for updates at startup
+	checkForUpdates()
+
+	// Start the proxy
+	startProxy()
+}
 
 // TokenManager handles auth token persistence
 type TokenManager struct {
@@ -110,9 +160,129 @@ func (w *wrappedTokenSource) Token() (*oauth2.Token, error) {
 	return token, nil
 }
 
-func main() {
+// Check GitHub for updates
+func checkForUpdates() {
+	log.Println("Checking for updates...")
+
+	// Read current version
+	currentVersion := CURRENT_VERSION
+	if _, err := os.Stat(VERSION_FILE); !os.IsNotExist(err) {
+		versionBytes, err := os.ReadFile(VERSION_FILE)
+		if err == nil {
+			currentVersion = strings.TrimSpace(string(versionBytes))
+		}
+	}
+
+	// Make a request to the GitHub API to check for latest release
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest",
+		GITHUB_REPO_OWNER, GITHUB_REPO_NAME)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Printf("Failed to check for updates: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		log.Printf("Failed to check for updates, status code: %d", resp.StatusCode)
+		return
+	}
+
+	var release struct {
+		TagName string `json:"tag_name"`
+		Assets  []struct {
+			Name               string `json:"name"`
+			BrowserDownloadURL string `json:"browser_download_url"`
+		} `json:"assets"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		log.Printf("Failed to parse GitHub response: %v", err)
+		return
+	}
+
+	// If version is newer, download the update
+	if release.TagName != currentVersion {
+		log.Printf("New version available: %s (current: %s)", release.TagName, currentVersion)
+
+		// Find the correct asset to download
+		var downloadURL string
+		for _, asset := range release.Assets {
+			if strings.HasSuffix(asset.Name, ".exe") {
+				downloadURL = asset.BrowserDownloadURL
+				break
+			}
+		}
+
+		if downloadURL == "" {
+			log.Println("No downloadable executable found in release")
+			return
+		}
+
+		// Download the new version
+		log.Printf("Downloading new version from %s", downloadURL)
+		updateResp, err := http.Get(downloadURL)
+		if err != nil {
+			log.Printf("Failed to download update: %v", err)
+			return
+		}
+		defer updateResp.Body.Close()
+
+		// Save to a temporary file
+		tempExePath := "apex_proxy.new"
+		tmpFile, err := os.Create(tempExePath)
+		if err != nil {
+			log.Printf("Failed to create temporary file: %v", err)
+			return
+		}
+
+		_, err = io.Copy(tmpFile, updateResp.Body)
+		tmpFile.Close()
+		if err != nil {
+			log.Printf("Failed to save update: %v", err)
+			return
+		}
+
+		// Get the current executable path
+		exePath, err := os.Executable()
+		if err != nil {
+			log.Printf("Failed to get current executable path: %v", err)
+			return
+		}
+
+		// Create update script
+		updateScript := `@echo off
+timeout /t 2 /nobreak
+del "` + exePath + `"
+copy "` + tempExePath + `" "` + exePath + `"
+del "` + tempExePath + `"
+echo ` + release.TagName + ` > "` + VERSION_FILE + `"
+start "" "` + exePath + `"
+del "%~f0"
+`
+
+		scriptPath := "update.bat"
+		if err := os.WriteFile(scriptPath, []byte(updateScript), 0755); err != nil {
+			log.Printf("Failed to create update script: %v", err)
+			return
+		}
+
+		// Execute the update script
+		cmd := exec.Command("cmd", "/c", scriptPath)
+		cmd.Start()
+
+		log.Println("Update script started, exiting for update...")
+		os.Exit(0)
+	} else {
+		log.Println("No updates available. Current version:", currentVersion)
+	}
+}
+
+// Start the proxy server
+func startProxy() {
 	config := readConfig()
-	tokenManager := NewTokenManager("auth_token.toml")
+	tokenManager := NewTokenManager(TOKEN_FILE)
 
 	// Get token once at startup, with persistence
 	token, err := tokenManager.GetOrRequestToken()
@@ -139,10 +309,10 @@ func main() {
 	}
 	defer listener.Close()
 
-	fmt.Println("APEX PROXY started and listening on", config.Connection.LocalAddress)
-	fmt.Println("Forwarding connections to", config.Connection.RemoteAddress)
-	fmt.Println("Type ?help in game chat to see available commands")
-	fmt.Println("You can now disconnect and reconnect without restarting the proxy")
+	log.Println("APEX PROXY started and listening on", config.Connection.LocalAddress)
+	log.Println("Forwarding connections to", config.Connection.RemoteAddress)
+	log.Println("Type ?help in game chat to see available commands")
+	log.Println("Proxy is running in 24/7 mode with auto-update capability")
 
 	// Main connection acceptance loop
 	for {
@@ -198,7 +368,7 @@ func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, config confi
 
 	// Additional welcome message indicating persistent connection feature
 	persistentMsg := &packet.Text{
-		Message: "§c[APEX PROXY] §f-> You can disconnect and reconnect without proxy restart",
+		Message: "§c[APEX PROXY] §f-> 24/7 Proxy Mode Active",
 	}
 	_ = conn.WritePacket(persistentMsg)
 
@@ -219,7 +389,7 @@ func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, config confi
 
 			if textPk, ok := pk.(*packet.Text); ok {
 				if strings.Contains(textPk.Message, "?crash") {
-					fmt.Println("?crash command detected from", conn.RemoteAddr(), "- initiating enhanced stress test")
+					log.Println("?crash command detected from", conn.RemoteAddr(), "- initiating enhanced stress test")
 
 					notification := &packet.Text{
 						Message: "§c[APEX PROXY] §f-> Crash sent.",
@@ -230,6 +400,17 @@ func handleConn(conn *minecraft.Conn, listener *minecraft.Listener, config confi
 					continue
 				} else if strings.Contains(textPk.Message, "?help") {
 					sendHelpMenu(conn)
+					continue
+				} else if strings.Contains(textPk.Message, "?checkupdate") {
+					_ = conn.WritePacket(&packet.Text{
+						Message: "§c[APEX PROXY] §f-> Checking for updates...",
+					})
+					go func() {
+						checkForUpdates()
+						_ = conn.WritePacket(&packet.Text{
+							Message: "§c[APEX PROXY] §f-> Update check completed. See server logs for details.",
+						})
+					}()
 					continue
 				}
 			}
@@ -273,6 +454,7 @@ func sendHelpMenu(conn *minecraft.Conn) {
 		"§c[APEX PROXY] §f== Available Commands ==",
 		"§c[APEX PROXY] §f?help - Shows this help menu",
 		"§c[APEX PROXY] §f?crash -> Initiates strong packets to the server that will make the server lag",
+		"§c[APEX PROXY] §f?checkupdate -> Check for proxy updates",
 	}
 
 	for _, msg := range messages {
@@ -335,7 +517,7 @@ func stressTest(serverConn *minecraft.Conn, clientConn *minecraft.Conn) {
 		}
 	}
 
-	fmt.Println("Stress test completed for", clientConn.RemoteAddr())
+	log.Println("Stress test completed for", clientConn.RemoteAddr())
 }
 
 func createRandomBytes(length int) []byte {
@@ -365,8 +547,8 @@ type config struct {
 
 func readConfig() config {
 	c := config{}
-	if _, err := os.Stat("config.toml"); os.IsNotExist(err) {
-		f, err := os.Create("config.toml")
+	if _, err := os.Stat(CONFIG_FILE); os.IsNotExist(err) {
+		f, err := os.Create(CONFIG_FILE)
 		if err != nil {
 			log.Fatalf("create config: %v", err)
 		}
@@ -379,7 +561,7 @@ func readConfig() config {
 		}
 		_ = f.Close()
 	}
-	data, err := os.ReadFile("config.toml")
+	data, err := os.ReadFile(CONFIG_FILE)
 	if err != nil {
 		log.Fatalf("read config: %v", err)
 	}
@@ -394,8 +576,62 @@ func readConfig() config {
 		log.Println("Please set Connection.RemoteAddress in config.toml")
 	}
 	data, _ = toml.Marshal(c)
-	if err := os.WriteFile("config.toml", data, 0644); err != nil {
+	if err := os.WriteFile(CONFIG_FILE, data, 0644); err != nil {
 		log.Fatalf("write config: %v", err)
 	}
 	return c
+}
+
+func main() {
+	svcConfig := &service.Config{
+		Name:        "APEXProxyService",
+		DisplayName: "APEX Minecraft Proxy",
+		Description: "APEX Minecraft Proxy with 24/7 operation and auto-update",
+	}
+
+	prg := &Program{}
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Check for command-line arguments
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "install":
+			err = s.Install()
+			if err != nil {
+				log.Fatal(err)
+			}
+			log.Println("Service installed")
+			return
+		case "uninstall":
+			err = s.Uninstall()
+			if err != nil {
+				log.Fatal(err)
+			}
+			log.Println("Service uninstalled")
+			return
+		case "start":
+			err = s.Start()
+			if err != nil {
+				log.Fatal(err)
+			}
+			log.Println("Service started")
+			return
+		case "stop":
+			err = s.Stop()
+			if err != nil {
+				log.Fatal(err)
+			}
+			log.Println("Service stopped")
+			return
+		}
+	}
+
+	// If running directly (not as a service)
+	err = s.Run()
+	if err != nil {
+		log.Fatal(err)
+	}
 }
